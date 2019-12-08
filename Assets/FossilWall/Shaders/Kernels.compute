@@ -1,0 +1,390 @@
+﻿#pragma kernel CSInit
+#pragma kernel CSUpdate
+#pragma kernel CSEmit
+#pragma kernel CSPushTargetPosition
+
+#define PI 3.14159265359
+
+#define TIME_TO_VANISH_FROM_PEELED 6.0
+
+struct ParticleData
+{
+	float4 velocity;
+	float4 position;
+	float4 targetPosition;
+	float4 rotation;
+	float4 color;
+	float  scale;
+	int    id;
+	int    alive;           // 生死 1: 生, 0: 死
+	int    isFossil;        // 化石部分であるかどうか 1:化石, 0:化石でない
+	float  valueToPeel;     // はがれるまでの値（0.0～1.0）1.0以上→はがれる
+	int    isPeeled;        // はがれているかどうか 1: はがれている, 0: はがれていない
+	float  timerFromPeeled; // はがれてからの時間（sec）
+};
+
+RWStructuredBuffer<ParticleData> _ParticleBuffer;
+AppendStructuredBuffer <int>     _ParticleDeadListBufferAppend;
+ConsumeStructuredBuffer<int>     _ParticleDeadListBufferConsume;
+
+Texture2D<float>  _MouseInteractionTex;
+Texture2D<float4> _FossilTex;
+
+float  _DeltaTime;
+float  _Timer;
+
+int2 _Resolution;
+
+float _VoxelSize;
+
+float3 _AreaCenter;
+float3 _AreaSize;
+
+float _MaxDepthNum;
+
+int _EmitCount;
+
+float3 _SpinParams;
+
+
+// -----------------------------------------------------------------
+// Functions
+// -----------------------------------------------------------------
+float nrand(float2 uv, float salt)
+{
+	uv += float2(salt, 0.0);
+	return frac(sin(dot(uv, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+
+float rand(float2 co)
+{
+	return frac(sin(dot(co.xy, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+//
+// Noise Shader Library for Unity - https://github.com/keijiro/NoiseShader
+//
+// Original work (webgl-noise) Copyright (C) 2011 Ashima Arts.
+// Translation and modification was made by Keijiro Takahashi.
+//
+// This shader is based on the webgl-noise GLSL shader. For further details
+// of the original shader, please see the following description from the
+// original source code.
+//
+
+//
+// Description : Array and textureless GLSL 2D/3D/4D simplex
+//               noise functions.
+//      Author : Ian McEwan, Ashima Arts.
+//  Maintainer : ijm
+//     Lastmod : 20110822 (ijm)
+//     License : Copyright (C) 2011 Ashima Arts. All rights reserved.
+//               Distributed under the MIT License. See LICENSE file.
+//               https://github.com/ashima/webgl-noise
+//
+
+float3 mod289(float3 x)
+{
+	return x - floor(x / 289.0) * 289.0;
+}
+
+float4 mod289(float4 x)
+{
+	return x - floor(x / 289.0) * 289.0;
+}
+
+float4 permute(float4 x)
+{
+	return mod289((x * 34.0 + 1.0) * x);
+}
+
+float4 taylorInvSqrt(float4 r)
+{
+	return 1.79284291400159 - r * 0.85373472095314;
+}
+
+float3 snoise_grad(float3 v)
+{
+	const float2 C = float2(1.0 / 6.0, 1.0 / 3.0);
+
+	// First corner
+	float3 i = floor(v + dot(v, C.yyy));
+	float3 x0 = v - i + dot(i, C.xxx);
+
+	// Other corners
+	float3 g = step(x0.yzx, x0.xyz);
+	float3 l = 1.0 - g;
+	float3 i1 = min(g.xyz, l.zxy);
+	float3 i2 = max(g.xyz, l.zxy);
+
+	// x1 = x0 - i1  + 1.0 * C.xxx;
+	// x2 = x0 - i2  + 2.0 * C.xxx;
+	// x3 = x0 - 1.0 + 3.0 * C.xxx;
+	float3 x1 = x0 - i1 + C.xxx;
+	float3 x2 = x0 - i2 + C.yyy;
+	float3 x3 = x0 - 0.5;
+
+	// Permutations
+	i = mod289(i); // Avoid truncation effects in permutation
+	float4 p =
+		permute(permute(permute(i.z + float4(0.0, i1.z, i2.z, 1.0))
+			+ i.y + float4(0.0, i1.y, i2.y, 1.0))
+			+ i.x + float4(0.0, i1.x, i2.x, 1.0));
+
+	// Gradients: 7x7 points over a square, mapped onto an octahedron.
+	// The ring size 17*17 = 289 is close to a multiple of 49 (49*6 = 294)
+	float4 j = p - 49.0 * floor(p / 49.0);  // mod(p,7*7)
+
+	float4 x_ = floor(j / 7.0);
+	float4 y_ = floor(j - 7.0 * x_);  // mod(j,N)
+
+	float4 x = (x_ * 2.0 + 0.5) / 7.0 - 1.0;
+	float4 y = (y_ * 2.0 + 0.5) / 7.0 - 1.0;
+
+	float4 h = 1.0 - abs(x) - abs(y);
+
+	float4 b0 = float4(x.xy, y.xy);
+	float4 b1 = float4(x.zw, y.zw);
+
+	//float4 s0 = float4(lessThan(b0, 0.0)) * 2.0 - 1.0;
+	//float4 s1 = float4(lessThan(b1, 0.0)) * 2.0 - 1.0;
+	float4 s0 = floor(b0) * 2.0 + 1.0;
+	float4 s1 = floor(b1) * 2.0 + 1.0;
+	float4 sh = -step(h, 0.0);
+
+	float4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+	float4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+
+	float3 g0 = float3(a0.xy, h.x);
+	float3 g1 = float3(a0.zw, h.y);
+	float3 g2 = float3(a1.xy, h.z);
+	float3 g3 = float3(a1.zw, h.w);
+
+	// Normalise gradients
+	float4 norm = taylorInvSqrt(float4(dot(g0, g0), dot(g1, g1), dot(g2, g2), dot(g3, g3)));
+	g0 *= norm.x;
+	g1 *= norm.y;
+	g2 *= norm.z;
+	g3 *= norm.w;
+
+	// Compute gradient of noise function at P
+	float4 m = max(0.6 - float4(dot(x0, x0), dot(x1, x1), dot(x2, x2), dot(x3, x3)), 0.0);
+	float4 m2 = m * m;
+	float4 m3 = m2 * m;
+	float4 m4 = m2 * m2;
+	float3 grad =
+		-6.0 * m3.x * x0 * dot(x0, g0) + m4.x * g0 +
+		-6.0 * m3.y * x1 * dot(x1, g1) + m4.y * g1 +
+		-6.0 * m3.z * x2 * dot(x2, g2) + m4.z * g2 +
+		-6.0 * m3.w * x3 * dot(x3, g3) + m4.w * g3;
+	return 42.0 * grad;
+}
+
+float3 dfNoise(float3 p, float3 params, float3 offset, float dt)
+{
+	float3 np = (p.xyz + offset.xyz) * params.x;
+	float3 n1 = snoise_grad(np);
+	float3 n2 = snoise_grad(np + float3(0, 13.28, 0));
+	return cross(n1, n2) * params.y * dt;
+}
+
+// Deterministic random rotation axis
+float3 get_rotation_axis(float2 uv)
+{
+	// Uniformaly distributed points
+	// http://mathworld.wolfram.com/SpherePointPicking.html
+	float u = nrand(uv, 10) * 2 - 1;
+	float theta = nrand(uv, 11) * PI * 2;
+	float u2 = sqrt(1 - u * u);
+	return float3(u2 * cos(theta), u2 * sin(theta), u);
+}
+
+// Quaternion multiplication.
+// http://mathworld.wolfram.com/Quaternion.html
+float4 qmul(float4 q1, float4 q2)
+{
+	return float4(
+		q2.xyz * q1.w + q1.xyz * q2.w + cross(q1.xyz, q2.xyz),
+		q1.w * q2.w - dot(q1.xyz, q2.xyz)
+	);
+}
+
+// -----------------------------------------------------------------
+// Kernels
+// -----------------------------------------------------------------
+// ボクセルを初期化
+[numthreads(32, 1, 1)]
+void CSInit(uint3 id : SV_DispatchThreadID)
+{
+	uint idx = id.x;
+
+	ParticleData p;
+	p.velocity = float4(0.0, 0.0, 0.0, 1.0);
+	p.position = float4(0.05, 0.0, 0.0, 1.0);
+	p.targetPosition = float4(0.0, 0.0, 0.0, 1.0);
+	p.rotation = float4(1.0, 0.0, 0.0, 1.0);
+	p.color = float4(0.0, 0.0, 0.0, 0.0);
+	p.scale    = 0.0;
+	p.id = idx;
+	p.alive    = 0;
+	p.isFossil = 0;
+	p.valueToPeel = 0.0;
+	p.isPeeled = 0;
+	p.timerFromPeeled = 0.0;
+
+	_ParticleBuffer[idx] = p;
+	_ParticleDeadListBufferAppend.Append(idx);
+}
+
+// ボクセルを更新
+[numthreads(32, 1, 1)]
+void CSUpdate(uint3 id : SV_DispatchThreadID)
+{
+	uint idx = id.x;
+
+	float dt = _DeltaTime;
+
+	ParticleData p = _ParticleBuffer[idx];
+
+	if (p.alive > 0.5)
+	{
+		// マウスインタラクション 強さ取得
+		float mouseInteractionValue = _MouseInteractionTex[uint2(
+			_MouseInteractionTex.Length.x * ((p.position.x + _AreaSize.x * 0.5 - _AreaCenter.x) / _AreaSize.x),
+			_MouseInteractionTex.Length.y * ((p.position.y + _AreaSize.y * 0.5 - _AreaCenter.y) / _AreaSize.y)
+		)].r;
+
+		// 奥行き 大きさ
+		float depthSize = (_VoxelSize * _MaxDepthNum);
+
+		// はぎとる強さ 奥であればはがれにくくする
+		float peelHardness = lerp(
+			0.0, 
+			1.0, 
+			abs(p.position.z) / depthSize
+		);
+		// 奥から2番目までは 化石であれば崩れにくく
+		peelHardness *= (abs(p.position.z) < _VoxelSize * 2.0) && (p.isFossil > 0.5) ? 0.02 : 1.0;
+		// 一番奥は 崩さない
+		peelHardness *= (abs(p.position.z) < _VoxelSize) ? 0 : 1;
+		peelHardness *= 25.0; // 調整
+		// 制限
+		peelHardness = clamp(peelHardness, 0, 25);
+		
+		// はがれるまでの値 加える
+		p.valueToPeel += mouseInteractionValue * dt * peelHardness;
+		
+		p.isPeeled = (p.valueToPeel > 1.0) ? 1 : 0;
+		p.isPeeled += depthSize * -1.0 > p.position.z ? 1 : 0;
+
+		// --- Acceleration, Velocity ---
+		// ノイズを加える
+		float3 acc = dfNoise(
+			p.position.xyz,
+			float3(0.5, 4.0, 0.0),
+			float3(0.0, 11.0, 22.0) + _Timer * 0.2,
+			dt);
+		// 手前に移動
+		acc += float3(0, 0, - 0.5);
+
+		// 速度更新 はがれていたら, 手前方向 + ノイズ を加える
+		p.velocity.xyz += acc * dt * p.isPeeled;
+		
+		// --- Position ---
+		// ターゲット位置更新
+		p.targetPosition.xyz += p.velocity.xyz * dt;
+		// 位置更新
+		p.position.xyz = lerp(p.position.xyz, p.targetPosition.xyz, dt * 2.0);
+		
+		// --- Scale ---
+		// はがれてしばらくしたらサイズを小さくする
+		p.scale += ((p.isPeeled > 0.5) ? -1.0 * saturate(smoothstep(3.0, TIME_TO_VANISH_FROM_PEELED, p.timerFromPeeled)) : 2.0) * dt;
+		p.scale = saturate(p.scale);
+
+		// --- Rotation ---
+		// 回転を加える
+		// Delta angle
+		float theta = (_SpinParams.x + length(p.velocity) * _SpinParams.y) * dt;
+
+		// Randomness
+		theta *= 1.0 - rand(float2(p.id * 0.1, 0.1)) * _SpinParams.z;
+		float4 dq = float4(get_rotation_axis(float2(p.id * 0.1, 0.2)) * sin(theta), cos(theta));
+		p.rotation = p.isPeeled ? normalize(qmul(dq, p.rotation)) : float4(0.0, 0.0, 0.0, 1.0);
+
+		// --- Timer ---
+		p.timerFromPeeled += (p.isPeeled > 0.5) ? dt : 0.0;
+
+		// はがれてからしばらくしたら消す
+		if (p.timerFromPeeled > TIME_TO_VANISH_FROM_PEELED)
+		{
+			p.alive = 0;
+			p.scale = 0.0;
+			_ParticleDeadListBufferAppend.Append(idx);
+		}		
+	}
+	else
+	{
+		p.scale = 0.0;
+	}
+
+	_ParticleBuffer[idx] = p;
+
+}
+
+// 手前に 1ボクセル 分 移動
+[numthreads(32, 1, 1)]
+void CSPushTargetPosition(uint3 id : SV_DispatchThreadID)
+{
+	uint idx = id.x;
+
+	ParticleData p = _ParticleBuffer[idx];
+
+	p.targetPosition.xyz += float3(0.0, 0.0, -_VoxelSize);
+	
+	_ParticleBuffer[idx] = p;
+}
+
+// 新しくボクセルを追加
+[numthreads(8,8,1)]
+void CSEmit (uint3 id : SV_DispatchThreadID)
+{
+	int idx = id.x + id.y * _Resolution.x;
+	if (idx >= _Resolution.x * _Resolution.y)
+		return;
+	
+	int pIndex = (int)_ParticleDeadListBufferConsume.Consume();
+
+	float sizeX = (_Resolution.x - 1) * _VoxelSize;
+	float sizeY = (_Resolution.y - 1) * _VoxelSize;
+
+	ParticleData p = _ParticleBuffer[pIndex];
+
+	float3 pos = float3(
+		id.x * _VoxelSize - sizeX * 0.5,
+		id.y * _VoxelSize - sizeY * 0.5,
+		0.0
+	);
+
+	float fossil = _FossilTex[uint2(
+		_FossilTex.Length.x * ((pos.x + _AreaSize.x * 0.5 - _AreaCenter.x) / _AreaSize.x),
+		_FossilTex.Length.y * ((pos.y + _AreaSize.y * 0.5 - _AreaCenter.y) / _AreaSize.y)
+	)].r;
+
+	bool isFossil = fossil > 0.5;
+
+	p.velocity = float4(0, 0, 0, 0);
+	p.position = float4(pos.xyz, 1.0);
+	p.targetPosition = float4(pos.xyz, 1.0);	
+	p.rotation = float4(0, 0, 0, 1);
+	p.color = isFossil ? float4(1, 1, 1, 1) : float4(0, 0, 0, 0);
+	p.scale = 0.0;
+	p.id = pIndex;
+	p.alive = 1;
+	p.isFossil = isFossil;
+	p.valueToPeel = 0.0;
+	p.isPeeled = 0;
+	p.timerFromPeeled = 0.0;
+
+	_ParticleBuffer[pIndex] = p;
+}
