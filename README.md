@@ -2,7 +2,7 @@
 voxel particles like fossil excavation
 
 ## Demo
-![demo](https://github.com/hiroakioishi/SoftBodyCrowd/blob/master/fossilWall_demo.gif)
+![demo](https://github.com/hiroakioishi/FossilWall/blob/master/fossilWall_demo.gif)
 
 ## Description
 Voxel particles traced with the mouse peel off
